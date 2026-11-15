@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Media Downloader
 // @namespace    https://toancreator.dev/
-// @version      1.8.4
+// @version      1.8.8
 // @description  Captures network links and downloads Video – Image – Audio (including HLS .m3u8 and YouTube) on hover. Liquid-glass UI with a "Quick download" button that lists everything downloadable on the page.
 // @author       ToanCreator
 // @match        *://*/*
@@ -37,6 +37,7 @@
     GRAB_AUTO: true,       // Khi tải bị 403: tự tải lại trang và bắt các đoạn video do trình phát tải (Grab)
     GRAB_MAX_RATE: 16,     // Grab: tốc độ phát tối đa khi bắt stream (nếu video bị thiếu đoạn thì thử hạ xuống 4 hoặc 8)
     GRAB_STALL_MS: 20000,  // Grab: không có đoạn mới sau bấy nhiêu ms thì coi là bị đứng và thử lại (seek tới mép đã bắt, hạ tốc độ)
+    GRAB_AUTO_BAR: false,   // Trình phát nhúng (iframe) dùng blob/MSE: tự hiện nút ⤓ ngay trên khung phát (khỏi cần menu Tampermonkey)
     GRAB_LOG: true,        // Grab: nếu bắt chưa đủ video, lưu thêm file <tên>_grablog.txt (chẩn đoán, không chứa token)
     GRAB_FINALIZE: true,   // Grab: chuyển fMP4 -> MP4 thường (tua được, có thời lượng) sau khi bắt xong, không mã hóa lại
     GRAB_PART_MB: 700,     // Grab: file lớn hơn mức này sẽ được lưu thành nhiều phần (_part1, _part2...) để đỡ tốn RAM
@@ -46,8 +47,45 @@
   const IS_TOP = (() => { try { return window.top === window; } catch (_) { return false; } })();
   // Dấu hiệu phiên bản thật sự đang chạy (khi dùng @require thì GM_info chỉ cho thấy phiên bản của đoạn loader, không phải của file này).
   // Kiểm tra: mở Console của trang và gõ  __MD_VERSION
-  const MD_VERSION = '1.8.4';
+  const MD_VERSION = '1.8.8';
   try { W.__MD_VERSION = MD_VERSION; } catch (_) {}
+
+  /* ===== DBG – BẢNG LOG CHẨN ĐOÁN (TẠM THỜI – sẽ gỡ sau khi sửa xong; đặt DEBUG_LOG = false để tắt) ===== */
+  const DEBUG_LOG = false;
+  const DBG = { lines: [], t0: Date.now(), once: new Set(), n: Object.create(null) };
+  const DBG_KEY = 'tc_dbg:' + location.hostname;
+  // Đường dẫn rút gọn: bỏ query/token, blob chỉ giữ đuôi
+  const dbgU = (u) => {
+    try {
+      u = String(u);
+      if (/^blob:/i.test(u)) return 'blob:…' + u.slice(-6);
+      if (/^data:/i.test(u)) return 'data:' + u.slice(5, 25) + '…';
+      const x = new URL(u, location.href), p = x.pathname.length > 56 ? '…' + x.pathname.slice(-54) : x.pathname;
+      return x.host + p + (x.search ? '?…' : '') + (x.hash && !/^#(access_token|token)/i.test(x.hash) ? x.hash.slice(0, 48) : '');
+    } catch (_) { return String(u).slice(0, 60); }
+  };
+  function dbg(tag, msg, onceKey) {
+    if (!DEBUG_LOG) return;
+    try {
+      if (onceKey) { if (DBG.once.has(onceKey)) return; DBG.once.add(onceKey); }
+      if (DBG.lines.length >= 700) DBG.lines.splice(0, 150);
+      DBG.lines.push(((Date.now() - DBG.t0) / 1000).toFixed(1) + 's ' + tag + ' ' + msg);
+    } catch (_) {}
+  }
+  const dbgN = (k, max) => { DBG.n[k] = (DBG.n[k] || 0) + 1; return DBG.n[k] <= max; };
+  if (DEBUG_LOG) {
+    try {
+      // giữ lại log của lần tải trang trước (Grab tải lại trang)
+      const prev = typeof GM_getValue === 'function' ? GM_getValue(DBG_KEY, '') : '';
+      if (prev) { String(prev).split('\n').slice(-90).forEach((l) => DBG.lines.push('· ' + l)); DBG.lines.push('──── page reloaded ────'); try { GM_deleteValue(DBG_KEY); } catch (_) {} }
+      window.addEventListener('pagehide', () => { try { GM_setValue(DBG_KEY, DBG.lines.slice(-150).join('\n')); } catch (_) {} });
+    } catch (_) {}
+    dbg('frm', (IS_TOP ? 'TOP ' : 'IFRAME ') + dbgU(location.href) + ' ref=' + (() => { try { return document.referrer ? new URL(document.referrer).host : '-'; } catch (_) { return '?'; } })() + ' state=' + document.readyState);
+    try {
+      dbg('env', 'v' + MD_VERSION + ' MediaSource=' + typeof W.MediaSource + (W.MediaSource && W.MediaSource.canConstructInDedicatedWorker ? ' (worker-MSE possible)' : '') +
+        ' Worker=' + typeof W.Worker + ' EME=' + typeof (W.navigator && W.navigator.requestMediaKeySystemAccess) + ' ' + ((navigator.userAgent.match(/(Firefox|Chrome)\/[\d.]+/) || [''])[0]));
+    } catch (_) {}
+  }
   try { if (IS_TOP) console.info('[Media Downloader] running v' + MD_VERSION + ' · grants: GM_getValue=' + (typeof GM_getValue) + ', GM_setValue=' + (typeof GM_setValue)); } catch (_) {}
   const IS_YT = /(^|\.)(youtube\.com|youtube-nocookie\.com)$/i.test(location.hostname);
   const IS_GRAB = /(^|\.)grabshorts\.com$/i.test(location.hostname);
@@ -258,6 +296,7 @@
     if (changed) {
       bump();
       if (!IS_TOP && !o.relay && o.from !== 'yt') {
+        try { dbg('relay', 'to top: ' + it.type + ' ' + (it.size || '?') + 'B ' + dbgU(it.url)); } catch (_) {}
         try {
           window.top.postMessage({ tcMedia: 1, item: { url: it.url, mime: it.mime, size: it.size, type: it.type, q: it.q, w: it.w, h: it.h, ref: it.ref, title: it.title } }, '*');
         } catch (_) {}
@@ -444,18 +483,50 @@
     TAP.bytes += fu.length; MSE.count++;
   }
 
+  // Một số trình phát dựng cả file video thành Blob rồi gán video.src = URL.createObjectURL(blob).
+  // Nhớ (bằng WeakRef, không giữ bộ nhớ) các blob video/audio lớn để có thể tải thẳng.
+  const BLOBS = new Map();
+  function hookBlobUrl(put) {
+    try {
+      const U = W.URL; if (!U || !U.createObjectURL) return;
+      const o = U.createObjectURL;
+      put(U, 'createObjectURL', function (obj) {
+        const u = o.apply(this, arguments);
+        try { if (dbgN('cou', 40)) dbg('blob', 'createObjectURL(' + ((obj && obj.constructor && obj.constructor.name) || typeof obj) + (obj && obj.size != null ? ' ' + (obj.type || '-') + ' ' + obj.size + 'B' : '') + ') -> ' + dbgU(u)); } catch (_) {}
+        try {
+          if (obj && typeof obj.size === 'number' && /^(video|audio)\//i.test(obj.type || '') && obj.size > 262144) {
+            BLOBS.set(u, typeof WeakRef === 'function' ? new WeakRef(obj) : obj);
+            if (BLOBS.size > 8) BLOBS.delete(BLOBS.keys().next().value);
+          }
+        } catch (_) {}
+        return u;
+      });
+    } catch (_) {}
+  }
+
   function hookMse(put) {
     try {
       const MS = W.MediaSource, SB = W.SourceBuffer;
       if (!MS || !SB) return;
       const oAdd = MS.prototype.addSourceBuffer, oApp = SB.prototype.appendBuffer;
+      try { const oIs = MS.isTypeSupported; if (typeof oIs === 'function') put(MS, 'isTypeSupported', function (m) { dbg('mse', 'isTypeSupported ' + m, 'its:' + m); return oIs.apply(this, arguments); }); } catch (_) {}
       put(MS.prototype, 'addSourceBuffer', function (mime) {
         const sb = oAdd.apply(this, arguments);
+        try { dbg('mse', 'addSourceBuffer ' + mime); } catch (_) {}
         try { const r = { mime: String(mime), inits: new Map(), cur: '', frags: new Map(), n: 0 }; MSE.list.push(r); MSE.map.set(sb, r); } catch (_) {}
         return sb;
       });
       put(SB.prototype, 'appendBuffer', function (data) {
         try { if (TAP.on) mseAdd(MSE.map.get(this), data); } catch (_) {}
+        try {
+          if (DEBUG_LOG) {
+            const n = DBG.n.app = (DBG.n.app || 0) + 1;
+            if (n <= 4 || n % 50 === 0) {
+              const u8 = data && data.byteLength != null ? new Uint8Array(data.buffer || data, data.byteOffset || 0, Math.min(12, data.byteLength)) : null;
+              dbg('mse', 'append #' + n + ' ' + (data && data.byteLength) + 'B tapOn=' + TAP.on + ' type=' + (u8 ? String.fromCharCode.apply(null, Array.from(u8).slice(4, 8)) : '?'));
+            }
+          }
+        } catch (_) {}
         return oApp.apply(this, arguments);
       });
     } catch (_) {}
@@ -757,6 +828,8 @@
       catch (_) { try { obj[name] = fn; } catch (__) {} }
     };
     hookMse(put);
+    hookBlobUrl(put);
+    try { const NP = W.Navigator && W.Navigator.prototype; if (NP && NP.requestMediaKeySystemAccess) { const oK = NP.requestMediaKeySystemAccess; put(NP, 'requestMediaKeySystemAccess', function (ks) { dbg('eme', 'requestMediaKeySystemAccess ' + ks + '  (DRM!)', 'eme:' + ks); return oK.apply(this, arguments); }); } } catch (_) {}
     try {
       const origFetch = W.fetch;
       if (typeof origFetch === 'function') {
@@ -768,9 +841,10 @@
               try {
                 sniff(res.url || reqUrl, res.headers.get('content-type'), res.headers.get('content-length'), res.headers.get('content-range'), res.status);
               } catch (_) {}
+              try { const ct = res.headers.get('content-type') || '-'; if (dbgN('net', 90) || /video|mpegurl|octet|mp4|mp2t|webm|audio|dash/i.test(ct)) dbg('net', 'fetch ' + res.status + ' ' + ct.slice(0, 30) + ' len=' + (res.headers.get('content-length') || '-') + ' ' + dbgU(res.url || reqUrl)); } catch (_) {}
               try { if (TAP.on && res.status >= 400) tapErr(res.status, res.url || reqUrl); } catch (_) {}
               try { tapFetch(res, reqUrl); } catch (_) {}
-            }, (e) => { try { if (TAP.on && !(e && e.name === 'AbortError')) tapErr(0, reqUrl); } catch (_) {} });
+            }, (e) => { try { if (TAP.on && !(e && e.name === 'AbortError')) tapErr(0, reqUrl); } catch (_) {} try { if (dbgN('netf', 30)) dbg('net', 'fetch FAIL ' + (e && e.name) + ' ' + dbgU(reqUrl)); } catch (_) {} });
           } catch (_) {}
           return p;
         });
@@ -787,6 +861,7 @@
         try {
           this.addEventListener('readystatechange', function () {
             if (this.readyState === 2) {
+              try { if (dbgN('xnet', 90) || /video|mpegurl|octet|mp4|mp2t|webm|audio|dash/i.test(this.getResponseHeader('content-type') || '')) dbg('net', 'xhr ' + this.status + ' ' + String(this.getResponseHeader('content-type') || '-').slice(0, 30) + ' len=' + (this.getResponseHeader('content-length') || '-') + ' rt=' + (this.responseType || 'text') + ' ' + dbgU(this.responseURL || this.__tcu)); } catch (_) {}
               try {
                 sniff(this.responseURL || this.__tcu, this.getResponseHeader('content-type'), this.getResponseHeader('content-length'), this.getResponseHeader('content-range'), this.status);
               } catch (_) {}
@@ -804,6 +879,7 @@
       const po = new PerformanceObserver((list) => {
         list.getEntries().forEach((e) => {
           const t = e.initiatorType;
+          try { if (t !== 'img' && t !== 'css' && t !== 'link' && t !== 'script' && (dbgN('perf', 60) || /video|audio|media/.test(t) || /\.(mp4|m4s|ts|webm|m3u8|mpd|mkv|mp3|aac)(\?|$)/i.test(e.name))) dbg('perf', t + ' ' + (e.encodedBodySize || e.transferSize || 0) + 'B ' + dbgU(e.name)); } catch (_) {}
           record(e.name, {
             from: 'perf',
             size: e.encodedBodySize || e.decodedBodySize || null,
@@ -1617,6 +1693,7 @@
   .thumb:hover{background:rgba(255,255,255,.24)}
   .thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
   .thumb svg{position:relative}
+  .recrow{display:block;width:100%;margin:8px 0 2px;padding:11px 12px;border:1px dashed rgba(128,128,128,.45);border-radius:12px;background:transparent;color:var(--ink-2);font:inherit;font-size:12.5px;line-height:1.4;text-align:center;cursor:pointer}.recrow:hover{background:rgba(128,128,128,.14)}
   .empty{padding:26px 14px;text-align:center;color:var(--ink-2);font-size:13px;line-height:1.55;white-space:pre-line}
   .foot{display:flex;align-items:center;gap:8px;padding:12px 18px 18px;border-top:1px solid rgba(255,255,255,.16)}
   .hint{flex:1;font-size:12px;color:var(--ink-3)}
@@ -1955,6 +2032,10 @@
       });
     }
 
+    // Trình phát nhúng (iframe) không có link tải trực tiếp: cho ghi hình thẳng từ trình phát
+    const recRow = h('button', { class: 'recrow', type: 'button' }, '🎬 Can’t download it? Record the video from the player…');
+    recRow.addEventListener('click', () => { closePanel(); if (!Rec.show({})) toast('No video found on this page', 3000); });
+
     function render() {
       const keepScroll = list.scrollTop;
       if (P.filter !== 'all' && !SET[P.filter]) P.filter = 'all';
@@ -1985,6 +2066,7 @@
         P.rows.set(it.key, { row, m, r });
         list.append(row);
       });
+      if (P.mode !== 'all' || !vis.length) list.append(recRow);
       list.scrollTop = keepScroll;
       hint.textContent = P.busy ? 'Fetching list…' : vis.length + (vis.length === 1 ? ' item' : ' items') + (P.note ? ' · ' + P.note : '');
       updateHead();
@@ -2502,7 +2584,7 @@
     function c0Incomplete() { try { const c = coverage(); return !!(c.n && c.got < c.n); } catch (_) { return false; } }
 
     function grabName() {
-      let b = String(S.name || '').replace(/\.[a-z0-9]{2,4}$/i, '');
+      let b = String(S.name || S.pt || '').replace(/\.[a-z0-9]{2,4}$/i, '');
       return sanitize(b || document.title) || 'video';
     }
 
@@ -2559,6 +2641,7 @@
         const prev = { muted: v.muted, rate: v.playbackRate, loop: v.loop, paused: v.paused };
         undo.push(() => { try { v.playbackRate = prev.rate; v.muted = prev.muted; v.loop = prev.loop; v.currentTime = 0; if (prev.paused) v.pause(); } catch (_) {} });
         v.muted = true; v.loop = false;
+        dbg('grab', 'runGrab start: video=' + dbgU(v.currentSrc || v.src) + ' rs=' + v.readyState + ' dur=' + v.duration + ' PL=' + PL.size + ' MSE.count=' + MSE.count);
         let rateMax = CFG.GRAB_MAX_RATE || 16, why = 'done';
         const setRate = () => { for (const r of [16, 8, 4, 2, 1].filter((x) => x <= rateMax)) { try { v.playbackRate = r; if (Math.abs(v.playbackRate - r) < 0.01) return r; } catch (_) {} } return 1; };
         let rate = setRate();
@@ -2584,6 +2667,7 @@
           if (v.paused && !v.ended) v.play().catch(() => {});
           if (Math.abs(v.playbackRate - rate) > 0.01) rate = setRate();
           const stalled = now - lastT > (CFG.GRAB_STALL_MS || 20000);
+          if (DEBUG_LOG && now - (DBG.lastLoop || 0) > 5000) { DBG.lastLoop = now; dbg('grab', 'loop mse=' + MSE.count + ' blind=' + TAP.blind.length + ' pl=' + PL.size + ' cov=' + c.got + '/' + c.n + ' t=' + v.currentTime.toFixed(1) + ' rate=' + v.playbackRate + ' ' + (v.paused ? 'paused' : 'playing') + ' rs=' + v.readyState + ' errs=' + TAP.errs.length); }
           if (v.ended || stalled) {
             if (blind) { if (stalled || now - lastT > 4000) break; }
             else if (useMse) {
@@ -2610,6 +2694,7 @@
           await sleep(400);
         }
         const diag = grabDiag(v, why, { rateMax, seeks, gotFrags: S.gdone, totalFrags: S.gtotal });
+        try { dbg('grab', 'exit: ' + why + ' ' + JSON.stringify({ video: diag.video, mse: diag.mse, netErrors: (diag.netErrors || []).slice(0, 5) }).slice(0, 900)); } catch (_) {}
         while (undo.length) { try { undo.pop()(); } catch (_) {} }
 
         // Đã bắt đủ tới cuối video chưa? (nếu thiếu thì báo rõ, tránh tưởng đã đủ rồi mới phát hiện khi xem)
@@ -2654,20 +2739,150 @@
         TAP.on = false; TAP.store.clear(); TAP.blind = []; TAP.bytes = 0; TAP.want.clear(); mseClear();
         S.state = 'idle';
         
+        dbg('grab', 'ERROR: ' + ((e && e.message) || e));
         flash((e && e.message) || 'Grab failed');
       }
     }
 
+    /* ---------- URL ẢO do Service Worker phục vụ (vd. abyssplayer: https://host/#mp4/chunk/20/<dung lượng>/<id>) ----------
+     * Trình phát này không dùng MSE / HLS / blob: <video src> trỏ về chính origin của iframe kèm #fragment, còn dữ liệu do
+     * Service Worker trả về (hỗ trợ Range). Vì vậy Grab (bắt MSE/playlist) không thấy gì. Cách xử lý: tự fetch URL đó
+     * từng khúc bằng Range ngay trong iframe (đúng origin -> đi qua Service Worker), ghép lại thành MP4. Tải ở đúng chất lượng đang phát. */
+    function virtualSrc(v) {
+      try {
+        const s = String(v && (v.currentSrc || v.src) || '');
+        if (!/^https?:/i.test(s)) return null;
+        const u = new URL(s, location.href);
+        if (u.origin !== location.origin || u.hash.length < 4) return null;
+        return u.href;
+      } catch (_) { return null; }
+    }
+    const SW_CH = 4 * 1048576;
+    // Lấy [a, b] của url; thử fetch gốc của trang trước (đi qua Service Worker của trang), rồi tới fetch của sandbox
+    async function swRange(url, a, b, via) {
+      const init = { credentials: 'include', headers: { Range: 'bytes=' + a + '-' + b }, cache: 'no-store' };
+      const fs = [['page', NATIVE_FETCH], ['sandbox', window.fetch ? window.fetch.bind(window) : null]].filter((x) => x[1] && (!via || x[0] === via));
+      let last = null;
+      for (const [name, f] of fs) {
+        try {
+          const r = await f(url, init);
+          const ct = r.headers.get('content-type') || '';
+          const buf = await r.arrayBuffer();
+          const out = { via: name, status: r.status, ct, cr: r.headers.get('content-range') || '', buf };
+          if (r.ok && !/html|json|text\/plain/i.test(ct)) return out;
+          last = out;
+        } catch (e) { last = { via: name, status: 0, ct: '', cr: '', buf: new ArrayBuffer(0), err: String((e && e.message) || e) }; }
+      }
+      return last || { via: '', status: 0, ct: '', cr: '', buf: new ArrayBuffer(0) };
+    }
+    async function swDownload(v) {
+      const url = virtualSrc(v);
+      if (!url || MSE.count || PL.size) return false;
+      const hint = (() => { const m = /\/(\d{6,})(?:\/|$)/.exec(new URL(url).hash); return m ? +m[1] : 0; })();
+      const p = await swRange(url, 0, SW_CH - 1);
+      const h8 = new Uint8Array(p.buf, 0, Math.min(12, p.buf.byteLength));
+      const sig = h8.length >= 8 ? String.fromCharCode(h8[4], h8[5], h8[6], h8[7]) : '';
+      dbg('sw', 'probe ' + dbgU(url) + ' via=' + p.via + ' st=' + p.status + ' ct=' + p.ct + ' len=' + p.buf.byteLength + ' cr=' + p.cr + ' sig=' + sig.replace(/[^\x20-\x7e]/g, '?') + ' hint=' + hint + (p.err ? ' err=' + p.err : ''));
+      const okMedia = (p.status === 200 || p.status === 206) && p.buf.byteLength >= 16 && /^(ftyp|styp|moof|moov|free|mdat|wide|skip)$/.test(sig);
+      if (!okMedia) return false;     // không phải video thật (vd. trả về trang HTML) -> để cách Grab xử lý
+
+      // Từ đây là đã chắc chắn: mọi lỗi báo thẳng, không tải lại trang
+      S.state = 'grabbing'; S.cancel = false; S.msg = ''; S.gdone = 0; S.gtotal = 0; S.gtxt = 'Downloading…'; render();
+      try {
+        const cm = /\/(\d+)\s*$/.exec(p.cr);
+        const total = p.status === 206 ? (cm ? +cm[1] : hint) : p.buf.byteLength;
+        if (p.status === 206 && !total) throw new Error('Unknown file size (no Content-Range)');
+        let blob;
+        if (p.status === 200 || p.buf.byteLength >= total) {
+          blob = new Blob([p.buf], { type: 'video/mp4' });                 // server không chia khúc / file nhỏ: đã có đủ
+        } else {
+          if (!total) throw new Error('Unknown file size');
+          const n = Math.ceil(total / SW_CH), parts = new Array(n); parts[0] = mkBlob(p.buf);
+          let next = 1, done = 1, bytes = p.buf.byteLength, fail = null;
+          S.gtotal = n;
+          const worker = async () => {
+            while (next < n && !fail) {
+              if (S.cancel) throw new Error('Cancelled');
+              const i = next++, a = i * SW_CH, b = Math.min(total, a + SW_CH) - 1, want = b - a + 1;
+              let r = null;
+              for (let k = 0; k < 4; k++) {
+                r = await swRange(url, a, b, p.via);
+                if (r.status === 206 && r.buf.byteLength === want) break;
+                r = null; await sleep(400 * (k + 1));
+              }
+              if (!r) throw new Error('Chunk ' + (i + 1) + '/' + n + ' failed');
+              parts[i] = mkBlob(r.buf); done++; bytes += want;
+              S.gdone = done; S.gtxt = 'Downloading ' + fmtSize(bytes) + ' / ' + fmtSize(total) + ' · ' + Math.round(bytes / total * 100) + '%'; render();
+            }
+          };
+          const res = await Promise.allSettled(Array.from({ length: Math.min(4, n - 1) }, () => worker().catch((e) => { fail = e; throw e; })));
+          const bad = res.find((x) => x.status === 'rejected');
+          if (bad) throw bad.reason;
+          blob = new Blob(parts, { type: 'video/mp4' });
+        }
+        const isWebm = /webm/i.test(p.ct);
+        if (!isWebm && CFG.GRAB_FINALIZE) {
+          S.gtxt = 'Finalizing…'; S.gtotal = 0; render();
+          try { blob = (await finalizeMp4(blob)).blob; } catch (_) { /* MP4 thường: giữ nguyên */ }
+        }
+        const q = v && v.videoHeight ? ' ' + v.videoHeight + 'p' : '';
+        saveBlob(blob, grabName() + q + '.' + (isWebm ? 'webm' : 'mp4'));
+        S.state = 'idle'; flash('Saved ✓ ' + fmtSize(blob.size) + (q ? ' ·' + q : ''), 12000);
+      } catch (e) {
+        S.state = 'idle';
+        dbg('sw', 'ERROR: ' + ((e && e.message) || e));
+        flash((e && e.message) || 'Download failed', 8000);
+      }
+      return true;
+    }
+    // Thứ tự: blob có sẵn -> URL ảo qua Service Worker -> tải lại trang và bắt stream (Grab)
+    async function startDownload() {
+      if (S.state !== 'idle') return;
+      const v = pickVideo();
+      let ok = false;
+      try { ok = await directBlob(v); } catch (_) {}
+      if (!ok) { try { ok = await swDownload(v); } catch (e) { dbg('sw', 'throw: ' + ((e && e.message) || e)); S.state = 'idle'; ok = false; } }
+      if (!ok) reloadGrab();
+    }
+
     // Tải lại trang (đánh dấu trước) để bắt TỪ ĐẦU mọi thứ trình phát tải; sau khi tải lại sẽ tự chạy runGrab()
+    // Video đang phát từ một blob hoàn chỉnh (URL.createObjectURL(blob)): lưu thẳng, không cần tải lại trang / ghi hình
+    async function directBlob(v) {
+      const src = String(v && (v.currentSrc || v.src) || '');
+      const ref = BLOBS.get(src), b = ref && (typeof ref.deref === 'function' ? ref.deref() : ref);
+      dbg('rec', 'click: src=' + dbgU(src) + ' knownBlobs=' + BLOBS.size + ' direct=' + (!!b && !!b.size));
+      if (!b || !b.size) return false;
+      let out = b;
+      if (/mp4|quicktime/i.test(b.type)) { try { out = (await finalizeMp4(b)).blob; } catch (_) { /* đã là MP4 thường */ } }
+      const ext = /webm/i.test(b.type) ? 'webm' : /mp4|quicktime/i.test(b.type) ? 'mp4' : (String(b.type).split('/')[1] || 'mp4').replace(/[^a-z0-9]/gi, '');
+      saveBlob(out, grabName() + '.' + ext);
+      flash('Saved ✓ ' + fmtSize(out.size), 8000);
+      return true;
+    }
+
+    // (TẠM THỜI) copy toàn bộ log vào clipboard
+    function dbgCopy() {
+      const t = 'Media Downloader ' + MD_VERSION + ' log (' + dbgU(location.href) + ')\n' + DBG.lines.join('\n');
+      const ok = () => flash('Log copied (' + DBG.lines.length + ' lines)', 3000);
+      const fb = () => { try { const ta = document.createElement('textarea'); ta.value = t; ta.style.cssText = 'position:fixed;opacity:0;top:0'; document.documentElement.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); ok(); } catch (_) { flash('Copy failed – use Save', 4000); } };
+      try { navigator.clipboard.writeText(t).then(ok, fb); } catch (_) { fb(); }
+    }
+
     function reloadGrab() {
       if (S.state !== 'idle') return;
       try { GM_setValue(GRAB_KEY, { t: Date.now(), name: S.name, h: location.href }); } catch (_) { return flash('Can’t reload: storage unavailable'); }
+      dbg('rec', 'reloadGrab: reloading ' + dbgU(location.href));
       flash('Reloading the page to capture the stream…');
       setTimeout(() => location.reload(), 700);
     }
 
     /* ---------- giao diện (div nổi, kéo thả được) ---------- */
     const REC_CSS = `
+.dwrap{margin-top:6px;width:min(88vw,380px);background:rgba(0,0,0,.82);color:#c9f2c9;border-radius:12px;font:11px/1.35 ui-monospace,Menlo,Consolas,monospace;overflow:hidden}
+.dtools{display:flex;gap:6px;padding:6px 6px 2px}
+.dbtn{padding:4px 10px;border-radius:8px;background:rgba(255,255,255,.18);color:#fff;font:600 11px system-ui,sans-serif}
+.dbg{margin:0;padding:6px 8px 8px;max-height:34vh;overflow:auto;white-space:pre-wrap;word-break:break-all;user-select:text;-webkit-user-select:text;touch-action:pan-y}
+.dwrap.min .dbg{display:none}
 .box{display:flex;align-items:center;gap:10px;padding:7px 8px 7px 7px;border-radius:999px;
   background:rgba(28,28,34,.58);-webkit-backdrop-filter:blur(18px) saturate(1.7);backdrop-filter:blur(18px) saturate(1.7);
   border:1px solid rgba(255,255,255,.22);box-shadow:0 8px 28px rgba(0,0,0,.38),inset 0 1px 0 rgba(255,255,255,.28);
@@ -2696,7 +2911,7 @@ button{all:unset;box-sizing:border-box;cursor:pointer}
       if (grabbing) {
         t = S.gtotal ? 'Downloading ' + S.gdone + '/' + S.gtotal + ' · ' + fmtSize(TAP.bytes) : (S.gtxt || 'Downloading…');
         if (S.gtotal && S.gtxt) t = S.gtxt;
-      } else t = S.msg || 'Download video';
+      } else t = S.msg || ('Download video' + (S.info ? ' · ' + S.info : ''));
       if (S.label.textContent !== t) S.label.textContent = t;
     }
 
@@ -2714,9 +2929,22 @@ button{all:unset;box-sizing:border-box;cursor:pointer}
       const x = h('button', { class: 'x', type: 'button', title: 'Close', 'aria-label': 'Close' }, '×');
       const box = h('div', { class: 'box' }, gbtn, label, x);
       root.append(box);
+      if (DEBUG_LOG) {
+        const pre = h('pre', { class: 'dbg' });
+        const wrap = h('div', { class: 'dwrap' });
+        const mkb = (t, f) => { const b = h('button', { class: 'dbtn', type: 'button' }, t); b.addEventListener('click', f); return b; };
+        const refresh = () => { const t = DBG.lines.slice(-140).join('\n'); if (pre.textContent !== t) { pre.textContent = t; pre.scrollTop = pre.scrollHeight; } };
+        const hideB = mkb('Hide', () => { wrap.classList.toggle('min'); hideB.textContent = wrap.classList.contains('min') ? 'Show log' : 'Hide'; });
+        wrap.append(h('div', { class: 'dtools' }, mkb('Copy', dbgCopy), mkb('Save', () => { try { saveBlob(new Blob([DBG.lines.join('\n')], { type: 'text/plain' }), 'md-debug-log.txt'); flash('Log saved to Downloads', 3000); } catch (_) {} }), mkb('Clear', () => { DBG.lines.length = 0; refresh(); }), hideB), pre);
+        ['click', 'mousedown', 'mouseup', 'pointerup', 'touchstart', 'touchend', 'dblclick', 'contextmenu'].forEach((ev) => wrap.addEventListener(ev, (e) => e.stopPropagation()));
+        root.append(wrap);
+        setInterval(refresh, 1000); refresh();
+      }
       Object.assign(S, { host, box, gbtn, label, x });
+      setInterval(() => { try { const v = pickVideo(), info = v && v.videoHeight ? v.videoHeight + 'p' : ''; if (info !== S.info) { S.info = info; render(); } } catch (_) {} }, 1500);
+      if (!IS_TOP) { try { window.parent.postMessage({ tcAskName: 1 }, '*'); } catch (_) {} }
 
-      gbtn.addEventListener('click', () => { if (S.state === 'grabbing') S.cancel = true; else reloadGrab(); });
+      gbtn.addEventListener('click', () => { if (S.state === 'grabbing') S.cancel = true; else startDownload(); });
       x.addEventListener('click', () => { if (S.state === 'idle') { host.remove(); } });
 
       // không để sự kiện lọt ra trang
@@ -2756,7 +2984,7 @@ button{all:unset;box-sizing:border-box;cursor:pointer}
       if (o.url) S.url = o.url;
       if (pickVideo()) {
         mount();
-        if (o.auto && CFG.GRAB_AUTO && S.state === 'idle') reloadGrab();
+        if (o.auto && CFG.GRAB_AUTO && S.state === 'idle') startDownload();
         return true;
       }
       let sent = false;
@@ -2766,13 +2994,48 @@ button{all:unset;box-sizing:border-box;cursor:pointer}
       return sent;
     }
 
+    // (TẠM THỜI) theo dõi trạng thái <video> và iframe, chỉ ghi vào log khi có thay đổi
+    function dbgPoll() {
+      let last = '', lastF = '', n = 0;
+      const iv = setInterval(() => {
+        try {
+          const ifs = document.querySelectorAll('iframe');
+          const fr = [...ifs].map((f) => dbgU(f.getAttribute('src') || 'about:blank') + (f.hasAttribute('sandbox') ? ' [sandbox=' + f.getAttribute('sandbox') + ']' : '')).join(' | ');
+          if (fr !== lastF) { lastF = fr; dbg('frm', 'iframes(' + ifs.length + '): ' + fr); }
+          const vs = allVideos();
+          const sig = vs.map((v) => [dbgU(v.currentSrc || v.src || (v.srcObject ? 'srcObject' : '-')), 'rs' + v.readyState, 'ns' + v.networkState, v.paused ? 'paused' : 'playing', v.videoWidth + 'x' + v.videoHeight, 'dur=' + (isFinite(v.duration) ? Math.floor(v.duration) : v.duration), v.error ? 'ERR' + v.error.code : '', v.muted ? 'muted' : '', 'x' + v.playbackRate, 't/15=' + Math.floor(v.currentTime / 15)].join(' ')).join(' ; ');
+          if (sig !== last) { last = sig; dbg('vid', vs.length + ' video: ' + sig); }
+        } catch (_) {}
+        if (++n > 1500) clearInterval(iv);
+      }, 1000);
+    }
+
     function init() {
+      if (DEBUG_LOG) dbgPoll();
+      window.addEventListener('message', (e) => {
+        const d = e.data;
+        if (!d || e.source === window) return;
+        if (d.tcAskName === 1) { try { e.source.postMessage({ tcName: 1, title: document.title || S.pt || '' }, '*'); } catch (_) {} }
+        else if (d.tcName === 1 && e.source === window.parent && typeof d.title === 'string') S.pt = d.title;
+      });
+      if (!IS_TOP) { try { window.parent.postMessage({ tcAskName: 1 }, '*'); } catch (_) {} }
       // frame con nhận lệnh từ frame cha
       window.addEventListener('message', (e) => {
         const d = e.data;
         if (!d || d.tcRec !== 1 || e.source !== window.parent || e.source === window) return;
         show({ name: typeof d.name === 'string' ? d.name : '', url: typeof d.url === 'string' ? d.url : '', auto: !!d.auto });
       });
+      // Trình phát nhúng dùng blob/MSE: tự hiện nút ngay trong khung đó (người dùng đóng bằng × thì không hiện lại)
+      if (!IS_TOP && CFG.GRAB_AUTO_BAR !== false && !/(^|\.)youtube(-nocookie)?\.com$/i.test(location.hostname)) {
+        const consider = () => {
+          if (S.host || GRAB_ARMED) return;
+          const v = pickVideo(); if (!v) return;
+          if (!/^blob:/.test(String(v.currentSrc || v.src || '')) && !v.srcObject && !virtualSrc(v)) return;   // blob (MSE/Blob), srcObject hoặc URL ảo (Service Worker)
+          if ((v.videoWidth || v.getBoundingClientRect().width) >= 200) mount();
+        };
+        ['loadedmetadata', 'playing', 'durationchange'].forEach((ev) => document.addEventListener(ev, consider, true));
+        let n = 0; const iv = setInterval(() => { consider(); if (S.host || ++n > 60) clearInterval(iv); }, 1500);
+      }
       // Vừa tải lại trang theo yêu cầu Grab: hiện div và tự bắt đầu
       if (GRAB_ARMED) {
         S.name = GRAB_ARMED.name || '';
@@ -2782,10 +3045,16 @@ button{all:unset;box-sizing:border-box;cursor:pointer}
         };
         const go = async () => {
           // Chờ video xuất hiện (trang có thể đổi URL/redirect rồi mới dựng trình phát)
-          const t0 = performance.now();
-          while (performance.now() - t0 < 20000 && !pickVideo()) await sleep(400);
+          // Frame đã phát lệnh (cùng origin + đường dẫn) thì chờ lâu hơn và nhắc người dùng bấm play (nhiều trình phát chỉ dựng <video> sau khi bấm)
+          const mine = (() => { try { const a = new URL(GRAB_ARMED.h); return a.origin === location.origin && a.pathname === location.pathname; } catch (_) { return false; } })();
+          const t0 = performance.now(), limit = mine ? 180000 : 20000;
+          let told = false;
+          while (performance.now() - t0 < limit && !pickVideo()) {
+            if (mine && !told && performance.now() - t0 > 2500) { told = true; mount(); flash('Press ▶ play to start capturing…', 185000); }
+            await sleep(400);
+          }
           // Frame không có video: bỏ qua (frame cha vẫn giữ lệnh để chạy kiểu "bấm play")
-          if (!pickVideo() && !IS_TOP) { disarm(); return; }
+          if (!pickVideo() && !IS_TOP) { if (mine) flash('No video appeared – capture cancelled', 6000); disarm(); return; }
           // Khóa chỉ bị xóa khi có frame nhận lệnh; frame khác đã nhận rồi thì bỏ
           let still = null;
           try { still = GM_getValue(GRAB_KEY, null); } catch (_) {}
