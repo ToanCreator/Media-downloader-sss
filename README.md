@@ -183,7 +183,7 @@ Found a bug or have an idea? Leave a review or contact me through the add-on pag
 
 <div align="center">
 
-If you like Media downloader SSS, a ⭐ review on Firefox Add-ons helps a lot. Thank you!
+If you like Media downloader SSS, a ⭐ review on Firefox Add-ons helps a lot.
 
 [![Get for Firefox](https://img.shields.io/badge/Get%20for-Firefox-FF7139?style=for-the-badge&logo=firefox-browser&logoColor=white)](https://addons.mozilla.org/vi/firefox/addon/media-downloader-sss/)
 
